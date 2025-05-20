@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail # Exit on error, undefined variable, or pipe failure
+
+# --- Configuration & Dependencies Check ---
+# Ensure necessary commands are available
+for cmd in curl grep jq fzf mpv chafa; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: Required command '$cmd' not found. Please install it." >&2
+    exit 1
+  fi
+done
+
+# --- Parameter Handling ---
+audio_only=false
+search_query_arg="" # Initialize
+
+# Simple help function
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [-a] [search_query]
+  -a: Audio only
+  [search_query]: Your YouTube search query. If not provided, you will be prompted.
+
+Example:
+  $(basename "$0") "epic sax guy"
+  $(basename "$0") -a lofi hip hop radio
+  $(basename "$0")
+EOF
+  exit 1
+}
+
+# Parse options
+while getopts ":ah" opt; do
+  case ${opt} in
+    a)
+      audio_only=true
+      ;;
+    h)
+      usage
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      usage
+      ;;
+  esac
+done
+shift $((OPTIND -1)) # Remove processed options (like -a)
+
+# Handle search query: either from arguments or prompt
+if [ $# -eq 0 ]; then
+  # No search terms provided as arguments, prompt the user
+  read -r -p "Enter search query: " search_query_input
+  if [ -z "$search_query_input" ]; then
+    echo "Error: Search query cannot be empty." >&2
+    exit 1
+  fi
+  search_query_arg="$search_query_input"
+else
+  # Use all remaining arguments as the search query
+  search_query_arg="$*"
+fi
+
+# --- URL Encoding and MPV Command ---
+# URL encode the search query using jq's @uri formatter
+encoded_search_query=$(printf %s "$search_query_arg" | jq -sRr @uri)
+url="https://www.youtube.com/results?search_query=$encoded_search_query"
+
+if [ "$audio_only" = true ]; then
+  mpv_cmd="mpv -v --volume=50 --no-video"
+else
+  mpv_cmd="mpv -v --volume=50 --force-window"
+fi
+
+# --- Fetch YouTube Page ---
+echo "Fetching YouTube results for: $search_query_arg..." >&2
+
+yt_page_content=$(curl -s --compressed \
+  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0" \
+  -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+  -H "Accept-Language: en-US,en;q=0.5" \
+  "$url")
+
+if [ -z "$yt_page_content" ]; then
+  echo "Error: Failed to fetch YouTube page. Check network or if YouTube changed its layout." >&2
+  exit 1
+fi
+
+# --- Extract ytInitialData JSON ---
+yt_initial_data=$(echo "$yt_page_content" | grep -oP 'var ytInitialData = \K.*?(?=;</script>)')
+
+if [ -z "$yt_initial_data" ]; then
+  echo "Error: Could not extract ytInitialData. YouTube page structure might have changed." >&2
+  exit 1
+fi
+
+# --- Process with JQ and FZF ---
+jq_filter_extract_data='
+[
+  .contents | .. | .videoRenderer? | select(. != null) |
+  {
+    scraper: "youtube_search",
+    url: ("https://www.youtube.com/watch?v=" + .videoId),
+    title: (.title.runs[0].text? // "N/A"),
+    channel: (.longBylineText.runs[0].text? // "N/A"),
+    duration: (.lengthText.simpleText? // "N/A"),
+    views: (.shortViewCountText.simpleText? // "N/A"),
+    date: (.publishedTimeText.simpleText? // "N/A"),
+    description: (.detailedMetadataSnippets[0].snippetText.runs[0].text? // ""),
+    id: .videoId,
+    thumbnail: (.thumbnail.thumbnails[0].url? // "")
+  }
+]
+'
+
+jq_filter_format_for_fzf='
+[.title, .channel, .duration, .views, .date, .id, .url] | @tsv
+'
+
+fzf_play_action="execute($mpv_cmd {7})+abort"
+
+echo "Processing data and launching fzf..." >&2
+echo "NOTE: Image previews depend on your terminal's capabilities and chafa." >&2
+# Test command for chafa auto-detection with a known good image:
+# curl -s https://www.kernel.org/theme/images/logos/tux.png | chafa --stretch
+
+# --- fzf command ---
+# MODIFIED: chafa uses auto-detection (no -f sixels)
+# MODIFIED: Search term handling updated above
+echo "$yt_initial_data" | \
+  jq -r "$jq_filter_extract_data" | \
+  jq -c -r 'select(length > 0) | .[]' | \
+  jq -r "$jq_filter_format_for_fzf" | \
+  fzf --sync --reverse --height=100% \
+      --nth=1 --with-nth=1 \
+      --delimiter '\t' \
+      --preview-window 'right,40%,border-sharp' \
+      --preview 'video_id={6}; \
+                  if [ -n "$video_id" ]; then \
+                    curl -s "https://img.youtube.com/vi/${video_id}/hqdefault.jpg" | \
+                    chafa --stretch -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" \
+                      2>/dev/null || echo "Preview failed or chafa error."; \
+                  else \
+                    echo "No video ID for preview."; \
+                  fi' \
+      --bind 'ctrl-w:toggle-preview' \
+      --bind "ctrl-o:$fzf_play_action" \
+      --bind "enter:$fzf_play_action"
+
+echo "Script finished." >&2
