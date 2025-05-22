@@ -2,6 +2,9 @@
 
 A command-line tool to search and play YouTube videos using `fzf` and `mpv`.
 
+## Preview
+![image](https://github.com/user-attachments/assets/336b95ea-328d-4213-ab3b-b093a3db2d36)
+
 ## Prerequisites
 
 -   **curl:** For making HTTP requests.
